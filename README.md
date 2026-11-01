@@ -2,7 +2,7 @@
 
 Forge Steel RFP AI is a local Streamlit decision-support application for comparing supplier quotations for reinforcement steel against the buyer's RFP and supporting requirements. Live evaluations support Claude, Cohere.ai, Gemini, ChatGPT, and OpenRouter. The completed walkthrough is synthetic and works without an API key.
 
-The app does not make a contract award or legal eligibility decision. AI-proposed criterion scores feed the weighted score and ranking directly. Human reviewers must validate evidence and confirm mandatory gates under the project's procurement policy.
+The app does not make a contract award or legal eligibility decision. AI-proposed criterion scores feed weighted scoring and ranking directly; users should review the evidence, risks, and clarifications before making procurement decisions. The app does not implement a separate pass/fail gate or score-approval workflow.
 
 ## Run locally
 
@@ -20,26 +20,23 @@ If every supplier evaluation with Cohere times out, test the connection in **LLM
 
 ## Demo walkthrough
 
-Choose **Explore the completed demo** on Home. It opens a fully evaluated, ranked and reviewed sample run with four fictional suppliers, different prices and evidence strengths, two failed mandatory gates, a comparison table, chart, JSON/CSV downloads, and a review audit trail. The synthetic suppliers and results are clearly marked and never call an LLM.
+Choose **Explore the completed demo** on Home. It opens a fully evaluated sample run with four fictional suppliers, different prices and evidence strengths, a ranked leaderboard, comparison table, and chart. The synthetic suppliers and results are clearly marked and never call an LLM.
 
-For an end-to-end live upload test, use **Download synthetic steel RFP and four quotations** on **New steel RFP evaluation**. The ZIP contains one fictional RFP and four fictional, three-page supplier quotations. Each supplier PDF includes a clearly labeled C01–C05 evidence schedule aligned to the five example categories in the project brief: technical capability, implementation plan, commercial value, security and compliance, and support and experience. These are evidence statements, not pre-assigned criterion scores. Intentional gaps and the Orbit Fe 500 grade deviation remain explicit; missing evidence must not be inferred. Extract the PDFs and upload the RFP as a shared document and each supplier document under its supplier. All files are labelled `SYNTHETIC DEMO DATA`.
-
-For a more detailed, corporate-style walkthrough, use **Download corporate-style tender and two supplier pack** on the same page. This ZIP contains a fictional invitation to tender and technical requirements/evaluation matrix for shared documents, plus technical proposals, deviations/clarifications, commercial offers, and sample MTCs for Apex Steels and Nexa Steelworks. The page also offers a styled, searchable combined submission PDF for each of the four demo suppliers: Apex Steels and Nexa Steelworks use their four corporate-pack documents, while Bright Metals and Orbit Alloys use their available synthetic two-page quotation. Each combined PDF has a cover and bookmarks for its included document sections; the quotation-only files do not invent missing attachments. A styled, combined tender PDF and a separate **Download complete corporate pack as one PDF** button are also available. For a live multi-supplier evaluation, upload the tender-side PDFs as shared requirements, then upload each supplier's source PDFs only in its own supplier section; do not upload an all-in-one PDF as a shared document, as that would mix supplier evidence. The pack deliberately includes a delivery-date exception in Nexa's response to exercise gate and evidence review. Every organization, value, date, and certificate is synthetic; sample MTCs are not valid certificates. The structure is inspired by the supplied document categories but does not reproduce their text or assert real procurement policy.
-
-The corporate-style PDFs, including the Bright Metals and Orbit Alloys template-structured response packs, can be regenerated locally with:
+The synthetic RFP and quotation PDFs are in [`sample_data/`](./sample_data/). Regenerate them locally with:
 
 ```bash
-python sample_data1/generate_corporate_pack.py
+python sample_data/generate_samples.py
 ```
+
+All sample organizations, values, dates, and certificates are fictional. Sample MTCs are not valid certificates.
 
 ## Live evaluation
 
 1. Review the criteria and weights on **Criteria**. Criteria are loaded from and saved to SQLite. Active weighted criteria must total exactly 100%; these example weights are not a procurement policy.
-2. Upload the buyer's RFP/enquiry and supporting steel specification, BOQ, delivery schedule, and commercial terms. Optionally enter grade, quantity, delivery location/date, currency, and material requirements as stated in those documents. Configure pass/fail gates only from requirements explicitly marked mandatory in the RFP. Upload each supplier's technical offer, quotation, MTC, certificates, and other PDFs. Enter name, submission date, and experience rating. PDFs must contain extractable text and be no larger than 15 MB / 100 pages. OCR of scanned documents is not included.
-3. Confirm the provider-specific data-sharing notice. The uploaded PDF text, buyer requirements, configured gates, and supplier metadata are sent to the selected LLM for evaluation. It extracts steel grade, quantity, quality documents, commercial breakdown, delivery, evidence, and criterion assessments. Local keyword retrieval is enabled by default and remains scoped to shared requirements and the individual supplier's own PDFs.
+2. Upload the buyer's RFP/enquiry and supporting steel specification, BOQ, delivery schedule, and commercial terms. Optionally enter grade, quantity, delivery location/date, currency, and material requirements as stated in those documents. Upload each supplier's technical offer, quotation, MTC, certificates, and other PDFs. Enter name, submission date, and experience rating. PDFs must contain extractable text and be no larger than 15 MB / 100 pages. OCR of scanned documents is not included.
+3. Confirm the provider-specific data-sharing notice. The uploaded PDF text, buyer requirements, and supplier metadata are sent to the selected LLM for evaluation. It extracts steel grade, quantity, quality documents, commercial breakdown, delivery, evidence, and criterion assessments. Local keyword retrieval is enabled by default and remains scoped to shared requirements and the individual supplier's own PDFs.
 4. The response is parsed and validated before scoring. Missing criterion rows are filled with a zero score and `NOT_PROVIDED`; malformed scores are set to zero and marked `NOT_VERIFIABLE`; out-of-range scores are clipped to the criterion's valid range with a warning. Evidence citations must match an uploaded source and verifiable page text.
-5. Review the evidence and each mandatory gate in **Compare & review**. Human reviewers confirm gate outcomes; they do not approve or override criterion scores. Python calculates weighted totals from the AI-proposed scores, per-criterion peer benchmarks, score gaps, relative percentages, PPI, and deterministic ranking.
-6. Finalize only after every supplier's mandatory-gate outcomes are reviewed and resolved.
+5. Review the evidence, scores, risks, and clarifications in **Compare & review**. Python calculates weighted totals from AI-proposed scores, per-criterion peer benchmarks, score gaps, relative percentages, PPI, and deterministic ranking. There is no separate eligibility filter or gate-review/finalization flow.
 
 ## Q&A Bot
 
@@ -53,7 +50,7 @@ Only the highest-ranked evidence chunks are sent to the run's selected LLM. Cita
 
 Before each Q&A scope, confirm that document chunks and questions may be sent to the currently selected provider for embeddings where supported, and that the question plus retrieved excerpts may be sent to that provider for an answer. The app stores extracted page text in the local SQLite database, separate from run JSON exports, so saved runs remain available to the bot; original PDFs and API keys are not stored. Do not use this with confidential documents unless the provider and this local retention are approved.
 
-The five weighted starter categories follow the project brief's examples: Technical Capability (30%), Implementation Plan (20%), Commercial Value (20%), Security & Compliance (20%), and Support & Experience (10%). Their descriptions and rubrics apply these broad categories to the steel-supplier example. The weights remain examples, not procurement policy; review them against the actual procurement policy. Mandatory RFP pass/fail gates remain separate from weighted criteria. A commercial score is calculated only after the reviewer confirms that the RFP permits lowest-total-price scoring and the extracted quotes have positive totals, common currency, matching quantity and delivery basis, and comparable scope. Missing charges are never inferred; otherwise commercial scoring is marked `NOT_COMPARABLE` pending human resolution. Certificates are not treated as independently authenticated.
+The five weighted starter categories follow the project brief's examples: Technical Capability (30%), Implementation Plan (20%), Commercial Value (20%), Security & Compliance (20%), and Support & Experience (10%). Their descriptions and rubrics apply these broad categories to the steel-supplier example. The weights remain examples, not procurement policy; review them against the actual procurement policy. No separate pass/fail gate workflow is used. A commercial score is calculated only after the user confirms that the RFP permits lowest-total-price scoring and the extracted quotes have positive totals, common currency, matching quantity and delivery basis, and comparable scope. Missing charges are never inferred; otherwise commercial scoring is marked `NOT_COMPARABLE`. Certificates are not treated as independently authenticated.
 
 The app stores run metadata, extracted page text for Q&A, scores, cited snippets and review audit events in `data/evaluations.sqlite3`; it does not store original uploaded PDFs or API keys. The local database is ignored by git. Local SQLite is not durable shared storage for a hosted multi-user deployment.
 
@@ -69,9 +66,9 @@ The app stores run metadata, extracted page text for Q&A, scores, cited snippets
 
 `PPI = weighted average of available criterion relative-performance percentages`
 
-Mandatory gates are separate from weighted scoring. A supplier with a failed gate is ineligible; pending gates do not qualify for a recommendation. Eligible suppliers are ranked by PPI descending, earlier submission date, higher experience rating, then supplier name ascending. Ineligible suppliers follow eligible ones and use the same ordering. Absolute weighted score is reported but is not an extra tie-break. If a criterion benchmark is zero or unavailable, its relative percentage is undefined and excluded from PPI; PPI is reweighted over the criteria with defined relative percentages. The leaderboard and run details show the ranking policy.
+Suppliers are ranked by PPI descending, then earlier submission date, higher experience rating, and supplier name ascending. Absolute weighted score is reported but is not an extra tie-break. If a criterion benchmark is zero or unavailable, its relative percentage is undefined and excluded from PPI; PPI is reweighted over the criteria with defined relative percentages. The leaderboard and run details show the ranking policy.
 
-The evaluation prompt uses only the uploaded buyer and current supplier documents, rejects citations to unknown files/pages, and validates exactly one score per active criterion regardless of provider. AI-proposed criterion scores are used directly for weighted totals and ranking; mandatory-gate outcomes remain subject to human review.
+The evaluation prompt uses only the uploaded buyer and current supplier documents, rejects citations to unknown files/pages, and validates exactly one score per active criterion regardless of provider. AI-proposed criterion scores are used directly for weighted totals and ranking.
 
 ## Current MVP boundaries
 
