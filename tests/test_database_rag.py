@@ -1,24 +1,41 @@
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from src.database import (
+    audit_events,
     connect,
+    criterion_evaluations,
+    evaluation_warnings,
     get_app_setting,
     initialize,
     load_criteria,
     load_rag_corpus,
     load_run,
+    list_audit_chain,
+    reserve_next_run_id,
     save_app_setting,
     save_criteria,
     save_rag_corpus,
     save_run,
+    workflow_traces,
+    verify_audit_chain,
 )
 from src.scoring import STARTER_CRITERIA
 
 
 class RagCorpusPersistenceTests(unittest.TestCase):
+    def test_run_ids_are_reserved_sequentially_starting_at_one(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "evaluations.sqlite3"
+            with patch("src.database.DB_PATH", database_path):
+                initialize()
+
+                self.assertEqual(reserve_next_run_id(), "RFP-0001")
+                self.assertEqual(reserve_next_run_id(), "RFP-0002")
+
     def test_migrates_exact_builtin_steel_criteria_without_touching_run_history(self):
         with tempfile.TemporaryDirectory() as directory:
             database_path = Path(directory) / "evaluations.sqlite3"
@@ -204,6 +221,111 @@ class RagCorpusPersistenceTests(unittest.TestCase):
                     tuple(supplier_row),
                     ("Supplier A", 87.5, 92.0, 1),
                 )
+
+    def test_persists_workflow_history_idempotently(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "evaluations.sqlite3"
+            with patch("src.database.DB_PATH", database_path):
+                initialize()
+                run = {
+                    "run_id": "RFP-HISTORY",
+                    "created_at": "2026-01-01T00:00:00+00:00",
+                    "mode": "RFP Proposal Evaluation",
+                    "status": "Evaluation complete",
+                    "is_demo": False,
+                    "warnings": ["Supplier A: Evidence citation was not verified."],
+                    "workflow_traces": [{
+                        "supplier_id": "supplier-a",
+                        "sequence": 1,
+                        "node": "validate",
+                        "status": "complete",
+                        "started_at": "2026-01-01T00:00:00+00:00",
+                        "completed_at": "2026-01-01T00:00:01+00:00",
+                        "details": {"criterion_count": 1},
+                    }],
+                    "audit_events": [{
+                        "supplier_id": "supplier-a",
+                        "event_type": "validate_complete",
+                        "event_at": "2026-01-01T00:00:01+00:00",
+                        "details": {"warning_count": 0},
+                    }],
+                    "suppliers": [{
+                        "supplier_id": "supplier-a",
+                        "name": "Supplier A",
+                        "criteria_results": [{
+                            "criterion_id": "C01",
+                            "ai_score": 7,
+                            "ai_status": "COMPLIANT",
+                            "justification": "Evidence provided.",
+                            "source_file": "offer.pdf",
+                            "page": 1,
+                        }],
+                    }],
+                }
+
+                save_run(run)
+                save_run(run)
+
+                self.assertEqual(len(workflow_traces("RFP-HISTORY")), 1)
+                self.assertEqual(workflow_traces("RFP-HISTORY")[0]["details"], {"criterion_count": 1})
+                self.assertEqual(len(audit_events("RFP-HISTORY")), 1)
+                self.assertEqual(len(evaluation_warnings("RFP-HISTORY")), 1)
+                self.assertEqual(len(criterion_evaluations("RFP-HISTORY")), 1)
+                self.assertEqual(
+                    criterion_evaluations("RFP-HISTORY")[0]["evaluation"]["justification"],
+                    "Evidence provided.",
+                )
+                self.assertTrue(verify_audit_chain()[0])
+                self.assertEqual(
+                    [item["event_type"] for item in list_audit_chain("RFP-HISTORY")],
+                    ["run_snapshot_saved", "validate_complete"],
+                )
+
+    def test_audit_chain_detects_changes_to_persisted_run_payload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "evaluations.sqlite3"
+            with patch("src.database.DB_PATH", database_path):
+                initialize()
+                save_run({
+                    "run_id": "RFP-TAMPER",
+                    "created_at": "2026-01-01T00:00:00+00:00",
+                    "mode": "RFP Proposal Evaluation",
+                    "status": "Evaluation complete",
+                    "is_demo": False,
+                    "suppliers": [],
+                })
+                self.assertEqual(verify_audit_chain(), (True, None))
+                with connect() as db:
+                    db.execute(
+                        "UPDATE runs SET payload = ? WHERE run_id = ?",
+                        ('{"status":"changed"}', "RFP-TAMPER"),
+                    )
+
+                valid, invalid_sequence = verify_audit_chain()
+
+                self.assertFalse(valid)
+                self.assertEqual(invalid_sequence, 1)
+
+    def test_audit_chain_rejects_updates_and_deletes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "evaluations.sqlite3"
+            with patch("src.database.DB_PATH", database_path):
+                initialize()
+                save_run({
+                    "run_id": "RFP-APPEND-ONLY",
+                    "created_at": "2026-01-01T00:00:00+00:00",
+                    "mode": "RFP Proposal Evaluation",
+                    "status": "Evaluation complete",
+                    "is_demo": False,
+                    "suppliers": [],
+                })
+                with connect() as db:
+                    with self.assertRaisesRegex(sqlite3.IntegrityError, "append-only"):
+                        db.execute(
+                            "UPDATE audit_chain SET event_type = 'changed' WHERE sequence = 1"
+                        )
+                    with self.assertRaisesRegex(sqlite3.IntegrityError, "append-only"):
+                        db.execute("DELETE FROM audit_chain WHERE sequence = 1")
 
 
 if __name__ == "__main__":

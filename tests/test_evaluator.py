@@ -2,7 +2,18 @@ import unittest
 import json
 from unittest.mock import patch
 
-from src.evaluator import EvaluationError, _build_prompt, _normalize_result, _parse_json_response, _retrieve_pages, _validate_result, evaluate_supplier
+from src.evaluator import (
+    EvaluationError,
+    _build_prompt,
+    _normalize_result,
+    _parse_json_response,
+    _retrieve_pages,
+    _validate_result,
+    estimate_output_tokens,
+    estimate_prompt_tokens,
+    evaluate_supplier,
+)
+from src.llm_providers import LLMGeneration
 
 
 CRITERIA = [
@@ -27,6 +38,27 @@ def document(document_id, filename, text):
 
 
 class EvaluatorTests(unittest.TestCase):
+    def test_prompt_token_estimate_uses_extracted_prompt_content_without_calling_provider(self):
+        with patch("src.evaluator.call_llm_with_usage") as call_llm:
+            baseline = estimate_prompt_tokens(
+                supplier={"name": "Supplier A"},
+                criteria=CRITERIA,
+                shared_documents=[document("rfp", "rfp.pdf", "Required capacity is 20.")],
+                supplier_documents=[document("offer", "offer.pdf", "Capacity is 20.")],
+                use_rag=False,
+            )
+            expanded = estimate_prompt_tokens(
+                supplier={"name": "Supplier A"},
+                criteria=CRITERIA,
+                shared_documents=[
+                    document("rfp", "rfp.pdf", "Required capacity is 20." * 100)
+                ],
+                supplier_documents=[document("offer", "offer.pdf", "Capacity is 20.")],
+                use_rag=False,
+            )
+        self.assertGreater(expanded, baseline)
+        call_llm.assert_not_called()
+
     def test_parses_json_object_after_model_commentary(self):
         response = (
             "The model may include commentary first.\n"
@@ -263,7 +295,12 @@ class EvaluatorTests(unittest.TestCase):
                 }
             ],
         }
-        with patch("src.evaluator.call_llm", return_value=json.dumps(provider_result)) as call:
+        with patch(
+            "src.evaluator.call_llm_with_usage",
+            return_value=LLMGeneration(
+                json.dumps(provider_result), input_tokens=84, output_tokens=26
+            ),
+        ) as call:
             result = evaluate_supplier(
                 api_key="key",
                 model="claude-model",
@@ -277,6 +314,15 @@ class EvaluatorTests(unittest.TestCase):
         self.assertEqual(result["provider"], "Claude")
         self.assertEqual(result["model"], "claude-model")
         self.assertEqual(call.call_args.args[0], "Claude")
+        self.assertEqual(
+            result["token_usage"], {"input_tokens": 84, "output_tokens": 26}
+        )
+
+    def test_output_token_estimate_scales_with_active_criteria(self):
+        self.assertEqual(
+            estimate_output_tokens(CRITERIA + [{"id": "inactive", "active": False}]),
+            340,
+        )
 
     def test_cohere_token_limit_retries_once_with_compact_output_instructions(self):
         supplier_doc = document(
@@ -298,7 +344,7 @@ class EvaluatorTests(unittest.TestCase):
             ],
         }
         with patch(
-            "src.evaluator.call_llm",
+            "src.evaluator.call_llm_with_usage",
             side_effect=[
                 RuntimeError("Cohere reached the output token limit."),
                 json.dumps(compact_result),
@@ -325,7 +371,7 @@ class EvaluatorTests(unittest.TestCase):
 
     def test_cohere_token_limit_after_compact_retry_reports_no_assessment(self):
         with patch(
-            "src.evaluator.call_llm",
+            "src.evaluator.call_llm_with_usage",
             side_effect=RuntimeError("Cohere reached the output token limit."),
         ) as call:
             with self.assertRaisesRegex(
@@ -366,7 +412,7 @@ class EvaluatorTests(unittest.TestCase):
                 }
             ],
         }
-        with patch("src.evaluator.call_llm", return_value=json.dumps(invalid_result)) as call:
+        with patch("src.evaluator.call_llm_with_usage", return_value=json.dumps(invalid_result)) as call:
             result = evaluate_supplier(
                 api_key="key",
                 model="claude-model",
@@ -403,7 +449,7 @@ class EvaluatorTests(unittest.TestCase):
                 }
             ],
         }
-        with patch("src.evaluator.call_llm", return_value=json.dumps(provider_result)) as call:
+        with patch("src.evaluator.call_llm_with_usage", return_value=json.dumps(provider_result)) as call:
             result = evaluate_supplier(
                 api_key="openrouter-key",
                 model="openai/gpt-4.1-mini",

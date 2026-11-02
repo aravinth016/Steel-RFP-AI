@@ -16,20 +16,32 @@ from dotenv import load_dotenv
 load_dotenv(override=False)
 
 from src.database import (
+    audit_events,
+    criterion_evaluations,
+    evaluation_warnings,
     get_app_setting,
     initialize,
     load_criteria,
     list_runs,
     load_rag_corpus,
     load_run,
+    list_audit_chain,
+    reserve_next_run_id,
     save_app_setting,
     save_criteria,
     save_rag_corpus,
     save_run,
+    workflow_traces,
+    verify_audit_chain,
 )
 from src.credentials import persist_api_key
 from src.documents import extract_pdf
-from src.evaluator import EvaluationError, evaluate_supplier
+from src.qa_exports import build_qa_csv, build_qa_pdf, build_report_pdf
+from src.evaluator import (
+    EvaluationError,
+    estimate_output_tokens,
+    estimate_prompt_tokens,
+)
 from src.llm_providers import (
     PROVIDERS,
     call_llm_text,
@@ -37,6 +49,7 @@ from src.llm_providers import (
     secret_name,
     test_connection,
 )
+from src.workflow import run_supplier_evaluation
 from src.rag import (
     DEFAULT_EMBEDDING_MODEL,
     EMBEDDING_CONFIG,
@@ -56,6 +69,7 @@ from src.scoring import (
     validate_criteria,
     weighted_score,
 )
+from src.scenarios import analyze_sensitivity, evaluate_scenario
 
 
 st.set_page_config(
@@ -67,7 +81,7 @@ st.set_page_config(
 initialize()
 
 def new_run_id() -> str:
-    return f"RFP-{datetime.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:6].upper()}"
+    return reserve_next_run_id()
 
 
 def new_document(uploaded: Any, scope: str) -> dict[str, Any]:
@@ -79,6 +93,88 @@ def new_document(uploaded: Any, scope: str) -> dict[str, Any]:
         "size_bytes": uploaded.size,
         "scope": scope,
         "pages": extracted.pages,
+    }
+
+
+def prepare_pending_evaluation(
+    *,
+    shared_files: Any,
+    supplier_inputs: list[tuple[str, str, float, Any, str]],
+    provider: str,
+    model: str,
+    criteria: list[dict[str, Any]],
+    use_rag: bool,
+    prices_comparable: bool,
+    buyer_requirements: dict[str, Any],
+) -> dict[str, Any]:
+    if not shared_files:
+        raise ValueError("Upload the buyer RFP or a shared requirement document before evaluating suppliers.")
+    shared_docs = [new_document(item, "shared") for item in shared_files]
+    suppliers: list[dict[str, Any]] = []
+    for name, submitted, experience, files, notes in supplier_inputs:
+        if not files:
+            raise ValueError(f"{name}: upload at least one quotation or technical offer PDF.")
+        docs = [new_document(item, "supplier") for item in files]
+        suppliers.append({
+            "supplier_id": uuid.uuid4().hex[:12],
+            "name": name,
+            "submission_date": submitted,
+            "experience": experience,
+            "price": None,
+            "currency": None,
+            "notes": notes,
+            "documents": [{key: value for key, value in doc.items() if key != "pages"} for doc in docs],
+            "_docs": docs,
+        })
+    run = {
+        "run_id": new_run_id(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "mode": "RFP Proposal Evaluation",
+        "status": "Evaluating",
+        "is_demo": False,
+        "provider": provider,
+        "model": model,
+        "rag_embedding_model": st.session_state.get(
+            f"rag_embedding_model_{provider}", EMBEDDING_CONFIG[provider][1]
+        ),
+        "rag_embedding_provider": provider,
+        "use_rag": use_rag,
+        "prices_comparable": prices_comparable,
+        "buyer_requirements": buyer_requirements,
+        "ranking_policy": "Weighted PPI descending; earlier submission date; higher experience rating; supplier name ascending.",
+        "criteria": criteria,
+        "shared_documents": [
+            {key: value for key, value in doc.items() if key != "pages"}
+            for doc in shared_docs
+        ],
+        "suppliers": [],
+        "expected_supplier_count": len(suppliers),
+        "warnings": [],
+        "workflow_traces": [],
+        "audit_events": [],
+    }
+    estimates = [
+        {
+            "supplier_id": supplier["supplier_id"],
+            "supplier": supplier["name"],
+            "input_tokens": estimate_prompt_tokens(
+                supplier={key: value for key, value in supplier.items() if key != "documents" and key != "_docs"},
+                criteria=criteria,
+                shared_documents=shared_docs,
+                supplier_documents=supplier["_docs"],
+                use_rag=use_rag,
+                buyer_requirements=buyer_requirements,
+            ),
+            "output_tokens": estimate_output_tokens(criteria),
+        }
+        for supplier in suppliers
+    ]
+    run["token_estimates"] = estimates
+    return {
+        "run": run,
+        "suppliers": suppliers,
+        "shared_docs": shared_docs,
+        "token_estimates": estimates,
     }
 
 
@@ -306,32 +402,304 @@ def apply_commercial_price_scores(run: dict[str, Any], all_suppliers_evaluated: 
 
 
 def render_home() -> None:
-    st.title("Forge Steel RFP AI")
-    st.caption("Construction steel procurement: TMT reinforcement steel quotations")
-    st.info(
-        "A transparent steel procurement decision-support tool. Your selected LLM proposes evidence-based criteria scores; "
-        "Python calculates weighted scores and ranking. Review findings and source evidence; the app does not make the final procurement decision."
-    )
     st.markdown(
         """
-        ### Start with a completed steel procurement walkthrough
-        The demo opens a complete, interactive run with four fictional steel suppliers, evidence,
-        weighted scores, findings, and comparison charts. No API key is needed
-        for the demo. **Every value is synthetic and is not a real quotation or procurement advice.**
-        """
+        <style>
+        .home-hero {
+            padding: 2.4rem 2.5rem;
+            border-radius: 24px;
+            color: #18324a;
+            background: linear-gradient(135deg, #f8fbff 0%, #eef7f5 100%);
+            border: 1px solid #d9e8e7;
+            border-left: 6px solid #168b79;
+            box-shadow: 0 12px 32px rgba(16, 36, 58, .08);
+            margin: .25rem 0 1.5rem;
+        }
+        .home-eyebrow {
+            color: #168b79;
+            font-size: .78rem;
+            font-weight: 750;
+            letter-spacing: .14em;
+            text-transform: uppercase;
+            margin-bottom: .7rem;
+        }
+        .home-hero h1 {
+            color: #18324a;
+            font-size: clamp(2rem, 5vw, 3.25rem);
+            line-height: 1.08;
+            letter-spacing: -.04em;
+            margin: 0 0 .85rem;
+        }
+        .home-hero p {
+            color: #526879;
+            font-size: 1.03rem;
+            line-height: 1.65;
+            max-width: 760px;
+            margin: 0;
+        }
+        .home-section-title {
+            font-size: 1.45rem;
+            font-weight: 750;
+            letter-spacing: -.025em;
+            margin: 1.35rem 0 .2rem;
+            color: #142a40;
+        }
+        .home-section-subtitle {
+            color: #64748b;
+            margin: 0 0 1rem;
+        }
+        .home-card {
+            height: 100%;
+            min-height: 142px;
+            padding: 1.15rem 1.2rem;
+            border: 1px solid #e3eaf0;
+            border-radius: 16px;
+            background: linear-gradient(180deg, #fff 0%, #f8fbfd 100%);
+            box-shadow: 0 5px 18px rgba(24, 50, 73, .055);
+        }
+        .home-card-icon {
+            font-size: 1.25rem;
+            margin-bottom: .55rem;
+        }
+        .home-card h3 {
+            color: #18324a;
+            font-size: 1.02rem;
+            margin: 0 0 .38rem;
+        }
+        .home-card p {
+            color: #5b6b7b;
+            line-height: 1.55;
+            font-size: .91rem;
+            margin: 0;
+        }
+        .home-demo {
+            padding: 1.4rem 1.5rem;
+            border: 1px solid #cfe7e4;
+            border-radius: 18px;
+            background: linear-gradient(120deg, #f0fbf8 0%, #f5f9ff 100%);
+            margin: .5rem 0 1rem;
+        }
+        .home-demo h3 {
+            color: #18324a;
+            font-size: 1.25rem;
+            margin: 0 0 .45rem;
+        }
+        .home-demo p {
+            color: #506577;
+            line-height: 1.6;
+            margin: 0;
+        }
+        .home-pill {
+            display: inline-block;
+            margin: .25rem .35rem .1rem 0;
+            padding: .3rem .65rem;
+            border-radius: 999px;
+            color: #145c5b;
+            background: #dff5ef;
+            border: 1px solid #c3e9df;
+            font-size: .78rem;
+            font-weight: 650;
+        }
+        @media (max-width: 760px) {
+            .home-hero { padding: 1.6rem 1.35rem; border-radius: 18px; }
+            .home-card { min-height: 0; }
+        }
+        </style>
+        <section class="home-hero">
+            <div class="home-eyebrow">Steel procurement · decision support</div>
+            <h1>Forge Steel RFP AI</h1>
+            <p>
+                Bring supplier quotations and your RFP into one evidence-led review.
+                Compare TMT reinforcement-steel offers with clear criteria, transparent
+                scoring, and source citations—while keeping the procurement decision
+                with your team.
+            </p>
+        </section>
+        <div class="home-section-title">About the application</div>
+        <p class="home-section-subtitle">
+            A practical workspace for organizing steel bids and reviewing what each offer actually supports.
+        </p>
+        """,
+        unsafe_allow_html=True,
     )
-    if st.button("Explore the completed demo", type="primary", width="stretch"):
+    overview_cards = [
+        (
+            "01",
+            "RFP-grounded review",
+            "Use buyer-provided requirements and steel documents to assess grade, quantity, delivery, quality records, and commercial terms.",
+        ),
+        (
+            "02",
+            "Evidence you can inspect",
+            "See extracted findings alongside document names, page references, risks, and clarification points.",
+        ),
+        (
+            "03",
+            "Transparent comparison",
+            "AI proposes criterion scores; Python applies configured weights, peer benchmarks, and deterministic ranking.",
+        ),
+    ]
+    for row_start in range(0, len(overview_cards), 2):
+        overview_columns = st.columns(2, gap="medium")
+        for column, (icon, title, description) in zip(
+            overview_columns, overview_cards[row_start : row_start + 2]
+        ):
+            with column:
+                st.markdown(
+                    f"""
+                    <div class="home-card">
+                        <div class="home-card-icon">{icon}</div>
+                        <h3>{title}</h3>
+                        <p>{description}</p>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+    st.markdown(
+        """
+        <div class="home-section-title">From uploaded files to the final score</div>
+        <p class="home-section-subtitle">
+            The app prepares each supplier's evidence, asks before sending it to the selected
+            provider, then calculates and ranks results locally.
+        </p>
+        """,
+        unsafe_allow_html=True,
+    )
+    evaluation_steps = [
+        (
+            "01",
+            "Upload & extract",
+            "Add the buyer RFP and each supplier's PDFs. Text and page references are extracted and checked locally; unreadable or unsupported files stop with an error.",
+        ),
+        (
+            "02",
+            "Prepare & confirm",
+            "The app prepares a separate supplier prompt, shows approximate input/output token estimates, and waits for your confirmation before any evaluation call.",
+        ),
+        (
+            "03",
+            "Assess & verify",
+            "The selected LLM proposes structured findings and citations. The app validates the response and checks citations against the uploaded documents.",
+        ),
+        (
+            "04",
+            "Score & compare",
+            "Python calculates weighted scores, applicable peer metrics, and deterministic ranks. You review the evidence and decide what to do next.",
+        ),
+    ]
+    for row_start in range(0, len(evaluation_steps), 2):
+        evaluation_columns = st.columns(2, gap="medium")
+        for column, (number, title, description) in zip(
+            evaluation_columns, evaluation_steps[row_start : row_start + 2]
+        ):
+            with column:
+                st.markdown(
+                    f"""
+                    <div class="home-card">
+                        <div class="home-card-icon">{number}</div>
+                        <h3>{title}</h3>
+                        <p>{description}</p>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+    st.markdown(
+        """
+        <div class="home-section-title">The StateGraph behind the process</div>
+        <p class="home-section-subtitle">
+            Each supplier follows its own path through these nodes. The graph records progress
+            and handles cached results and errors without mixing supplier evidence.
+        </p>
+        """,
+        unsafe_allow_html=True,
+    )
+    with st.container(border=True):
+        graph_nodes = [
+            (
+                "Prepare",
+                "Collect provider/model, criterion, requirements, and document counts. A validated cached result can skip the provider call.",
+            ),
+            (
+                "Evaluate",
+                "Send the prepared evidence for this supplier to the selected LLM and receive its structured assessment.",
+            ),
+            (
+                "Validate",
+                "Check the response against the strict evaluation schema and active criteria.",
+            ),
+            (
+                "Verify evidence",
+                "Check evidence citations against the uploaded pages and record verification warnings.",
+            ),
+            (
+                "Score",
+                "Calculate the weighted score deterministically in Python from the validated criterion results.",
+            ),
+            (
+                "Persist",
+                "Assemble the supplier result, warnings, stage trace, and audit events for run history.",
+            ),
+        ]
+        for row_start in range(0, len(graph_nodes), 2):
+            node_columns = st.columns(2, gap="medium")
+            for index, (node, function) in enumerate(
+                graph_nodes[row_start : row_start + 2], start=row_start
+            ):
+                with node_columns[index - row_start]:
+                    st.markdown(
+                        f"""
+                        <div class="home-card">
+                            <div class="home-card-icon">{index + 1:02d}</div>
+                            <h3>{node}</h3>
+                            <p>{function}</p>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+        st.info(
+            "**Normal path:** Prepare → Evaluate → Validate → Verify evidence → Score → Persist. "
+            "A validated cached result skips Evaluate. Evaluation or validation errors route "
+            "to Persist. An unverified citation is recorded as a warning and scoring continues; "
+            "a scoring error routes to Persist. A failed "
+            "supplier does not stop the remaining suppliers."
+        )
+    st.warning(
+        "Decision-support only: the app does not award contracts or make legal decisions. "
+        "AI-proposed scores are not an approval, and starter criteria/weights are examples—not procurement policy."
+    )
+    st.divider()
+    st.markdown(
+        """
+        <div class="home-section-title">Explore the interactive demo</div>
+        <p class="home-section-subtitle">
+            See the full review experience using a ready-made, fictional steel procurement run.
+        </p>
+        <div class="home-demo">
+            <h3>A complete sample comparison, ready to explore</h3>
+            <p>
+                Review four fictional suppliers—Apex Steels, Bright Metals, Nexa Steelworks,
+                and Orbit Alloys—with sample criteria scores, source-style evidence, steel
+                offer details, commercial comparisons, findings, and ranking.
+                The demo is generated locally and does not call an LLM.
+            </p>
+        </div>
+        <span class="home-pill">4 fictional suppliers</span>
+        <span class="home-pill">No API key needed</span>
+        <span class="home-pill">Interactive leaderboard</span>
+        <span class="home-pill">Evidence and findings</span>
+        <span class="home-pill">What-if analysis</span>
+        """,
+        unsafe_allow_html=True,
+    )
+    if st.button("Open the completed demo", type="primary", width="stretch"):
         criteria = st.session_state.get("criteria", STARTER_CRITERIA)
         demo = create_demo_run(criteria)
         st.session_state.active_run_id = demo["run_id"]
         st.session_state.page = "Leaderboard"
         st.session_state.pending_workspace_page = "Leaderboard"
         st.rerun()
-    st.divider()
-    st.subheader("Weighted scoring and findings")
-    st.write("Your selected LLM proposes evidence-based criterion scores, risks, and clarifications. The app normalizes scores and calculates totals deterministically.")
-    st.warning(
-        "The starter criteria and weights are examples only. Review them against the procurement policy before a real run."
+    st.caption(
+        "All demo suppliers, evidence, scores, and prices are synthetic; they are not real quotations or procurement advice."
     )
 
 
@@ -343,13 +711,6 @@ def render_new_evaluation() -> None:
     if errors:
         st.error("Criteria must be valid before a run can start: " + " ".join(errors))
         return
-    st.selectbox(
-        "LLM provider for this evaluation",
-        list(PROVIDERS),
-        key="llm_provider",
-        on_change=persist_selected_provider,
-        help="The provider selected here is the one used for this run. It is saved for future runs.",
-    )
     provider = selected_llm_provider()
     api_key = st.session_state.get(f"api_key_session_{provider}") or configured_api_key(provider)
     available_models = model_options(provider)
@@ -432,53 +793,18 @@ def render_new_evaluation() -> None:
             help="This attestation alone is not enough: extracted quote totals, currencies, quantities, delivery bases, and supplier comparability statuses must also agree.",
         )
         submitted_form = st.form_submit_button(f"Evaluate with {provider}", type="primary", width="stretch")
-    if not submitted_form:
-        return
-    if not confirmed:
-        st.error(f"Confirm the {provider} data-sharing notice before starting.")
-        return
-    names = [entry[0].casefold() for entry in supplier_inputs]
-    if any(not name for name in names) or len(names) != len(set(names)):
-        st.error("Enter a unique, non-empty name for every supplier.")
-        return
-    try:
-        if not shared_files:
-            raise ValueError("Upload the buyer RFP or a shared requirement document before evaluating suppliers.")
-        shared_docs = [new_document(item, "shared") for item in (shared_files or [])]
-        suppliers: list[dict[str, Any]] = []
-        for index, (name, submitted, experience, files, notes) in enumerate(supplier_inputs):
-            if not files:
-                raise ValueError(f"{name}: upload at least one quotation or technical offer PDF.")
-            docs = [new_document(item, "supplier") for item in files]
-            suppliers.append({
-                "supplier_id": uuid.uuid4().hex[:12],
-                "name": name,
-                "submission_date": submitted,
-                "experience": experience,
-                "price": None,
-                "currency": None,
-                "notes": notes,
-                "documents": [{key: value for key, value in doc.items() if key != "pages"} for doc in docs],
-                "_docs": docs,
-            })
-    except ValueError as exc:
-        st.error(str(exc))
-        return
-    run = {
-        "run_id": new_run_id(),
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "mode": mode,
-        "status": "Evaluating",
-        "is_demo": False,
-        "provider": provider,
-        "model": model,
-        "rag_embedding_model": st.session_state.get(
-            f"rag_embedding_model_{provider}", EMBEDDING_CONFIG[provider][1]
-        ),
-        "rag_embedding_provider": provider,
-        "use_rag": use_rag,
-        "prices_comparable": prices_comparable,
-        "buyer_requirements": {
+    pending = st.session_state.get("pending_evaluation")
+    if pending is None:
+        if not submitted_form:
+            return
+        if not confirmed:
+            st.error(f"Confirm the {provider} data-sharing notice before starting.")
+            return
+        names = [entry[0].casefold() for entry in supplier_inputs]
+        if any(not name for name in names) or len(names) != len(set(names)):
+            st.error("Enter a unique, non-empty name for every supplier.")
+            return
+        buyer_requirements = {
             "material": material_description.strip() or None,
             "required_grade": required_grade.strip() or None,
             "required_quantity_mt": required_quantity_mt or None,
@@ -486,14 +812,96 @@ def render_new_evaluation() -> None:
             "delivery_location": delivery_location.strip() or None,
             "required_delivery_date": required_delivery_date.strip() or None,
             "currency": buyer_currency.strip().upper() or None,
-        },
-        "ranking_policy": "Weighted PPI descending; earlier submission date; higher experience rating; supplier name ascending.",
-        "criteria": run_criteria,
-        "shared_documents": [{key: value for key, value in doc.items() if key != "pages"} for doc in shared_docs],
-        "suppliers": [],
-        "expected_supplier_count": len(suppliers),
-        "warnings": [],
-    }
+        }
+        try:
+            pending = prepare_pending_evaluation(
+                shared_files=shared_files,
+                supplier_inputs=supplier_inputs,
+                provider=provider,
+                model=model,
+                criteria=run_criteria,
+                use_rag=use_rag,
+                prices_comparable=prices_comparable,
+                buyer_requirements=buyer_requirements,
+            )
+        except ValueError as exc:
+            st.error(str(exc))
+            return
+        st.session_state["pending_evaluation"] = pending
+        st.rerun()
+
+    pending_run = pending["run"]
+    st.subheader("Pre-evaluation estimate")
+    st.caption(
+        f"Approximate token estimates for {pending_run['provider']} · "
+        f"`{pending_run['model']}`. This is a local estimate only; no provider call "
+        "has been made."
+    )
+    st.dataframe(
+        [
+            {
+                "Supplier": item["supplier"],
+                "Estimated input tokens": item["input_tokens"],
+                "Estimated output tokens": item["output_tokens"],
+                "Estimated total tokens": item["input_tokens"] + item["output_tokens"],
+            }
+            for item in pending["token_estimates"]
+        ],
+        hide_index=True,
+        width="stretch",
+    )
+    total_estimated_tokens = sum(
+        item["input_tokens"] for item in pending["token_estimates"]
+    )
+    total_estimated_output_tokens = sum(
+        item["output_tokens"] for item in pending["token_estimates"]
+    )
+    estimate_columns = st.columns(3)
+    estimate_columns[0].metric("Estimated input tokens", f"~{total_estimated_tokens:,}")
+    estimate_columns[1].metric(
+        "Estimated output tokens", f"~{total_estimated_output_tokens:,}"
+    )
+    estimate_columns[2].metric(
+        "Estimated total tokens",
+        f"~{total_estimated_tokens + total_estimated_output_tokens:,}",
+    )
+    st.caption(
+        "Input estimate uses a rough four-characters-per-token prompt heuristic; output "
+        "estimate uses an approximate per-criterion JSON allowance. Actual tokenization "
+        "and output length vary. Estimated cost is unavailable because a verified current "
+        "rate for this exact provider/model is not configured. These estimates do not "
+        "limit document text or model output."
+    )
+    proceed_col, cancel_col = st.columns(2)
+    with proceed_col:
+        proceed = st.button(
+            f"Proceed with {pending_run['provider']} evaluation",
+            type="primary",
+            width="stretch",
+        )
+    with cancel_col:
+        cancel = st.button("Discard pending evaluation", width="stretch")
+    if cancel:
+        st.session_state.pop("pending_evaluation", None)
+        st.rerun()
+    if not proceed:
+        return
+
+    run = pending_run
+    suppliers = pending["suppliers"]
+    shared_docs = pending["shared_docs"]
+    provider = run["provider"]
+    model = run["model"]
+    use_rag = run["use_rag"]
+    run_criteria = run["criteria"]
+    api_key = (
+        st.session_state.get(f"api_key_session_{provider}")
+        or configured_api_key(provider)
+    )
+    if not api_key:
+        st.error(f"{provider} API key is no longer available. Configure it under LLM Settings.")
+        return
+    st.session_state.pop("pending_evaluation", None)
     progress = st.progress(0, text="Validating files and extracting PDF text…")
     errors_by_supplier = []
     rag_documents = [dict(document) for document in shared_docs]
@@ -508,17 +916,23 @@ def render_new_evaluation() -> None:
                 0.15 + 0.75 * index / max(len(suppliers), 1),
                 text=f"Requesting {provider} model {model} for {supplier['name']}…",
             )
-            result = evaluate_supplier(
+            workflow_record = run_supplier_evaluation(
+                run_id=run["run_id"],
                 api_key=api_key,
                 model=model,
+                provider=provider,
                 supplier={key: value for key, value in supplier.items() if key != "documents"},
                 criteria=run_criteria,
                 shared_documents=shared_docs,
                 supplier_documents=supplier_docs,
                 use_rag=use_rag,
-                provider=provider,
                 buyer_requirements=run["buyer_requirements"],
             )
+            run["workflow_traces"].extend(workflow_record["traces"])
+            run["audit_events"].extend(workflow_record["audit_events"])
+            if workflow_record["status"] != "complete":
+                raise EvaluationError(workflow_record["error"] or "Supplier evaluation failed.")
+            result = workflow_record["evaluation"]
             progress.progress(
                 0.15 + 0.75 * index / max(len(suppliers), 1),
                 text=f"Response received from {provider} for {supplier['name']}; validating evidence…",
@@ -558,11 +972,27 @@ def render_new_evaluation() -> None:
                 "price": commercial_quote.get("total_quoted_amount"),
                 "currency": commercial_quote.get("currency"),
                 "provider": provider,
+                "workflow_weighted_score": workflow_record["weighted_score"],
+                "evidence_checks": workflow_record["evidence_checks"],
+                "token_usage": workflow_record.get("token_usage", {}),
+                "estimated_input_tokens": next(
+                    item["input_tokens"]
+                    for item in run["token_estimates"]
+                    if item["supplier_id"] == supplier["supplier_id"]
+                ),
+                "estimated_output_tokens": next(
+                    item["output_tokens"]
+                    for item in run["token_estimates"]
+                    if item["supplier_id"] == supplier["supplier_id"]
+                ),
             })
             run["suppliers"].append(saved_supplier)
             run["warnings"].extend(
                 f"{supplier['name']}: {warning}"
-                for warning in result.get("validation_warnings", [])
+                for warning in (
+                    result.get("validation_warnings", [])
+                    + workflow_record["warnings"]
+                )
             )
             rag_documents.extend(
                 {**document, "supplier_id": supplier["supplier_id"]}
@@ -639,6 +1069,24 @@ def render_leaderboard(run: dict[str, Any]) -> None:
             "Rank": supplier.get("rank"),
             "Supplier": supplier["name"],
             "Evaluation": "Failed" if supplier.get("evaluation_error") else "Completed",
+            "Estimated input tokens": next(
+                (
+                    item["input_tokens"]
+                    for item in run.get("token_estimates", [])
+                    if item.get("supplier_id") == supplier.get("supplier_id")
+                ),
+                None,
+            ),
+            "Estimated output tokens": next(
+                (
+                    item["output_tokens"]
+                    for item in run.get("token_estimates", [])
+                    if item.get("supplier_id") == supplier.get("supplier_id")
+                ),
+                None,
+            ),
+            "Actual input tokens": (supplier.get("token_usage") or {}).get("input_tokens"),
+            "Actual output tokens": (supplier.get("token_usage") or {}).get("output_tokens"),
             "AI weighted score": supplier.get("ai_score"),
             "PPI (peer benchmark)": supplier.get("ppi"),
             "Submitted": supplier.get("submission_date"),
@@ -668,18 +1116,53 @@ def render_leaderboard(run: dict[str, Any]) -> None:
         filtered = filtered.sort_values(sort_by, ascending=sort_by == "Supplier", na_position="last")
     st.dataframe(filtered, width="stretch", hide_index=True)
     st.caption(f"Ranking policy: {run['ranking_policy']}")
-    st.download_button(
-        "Download leaderboard CSV",
-        data=frame.to_csv(index=False).encode("utf-8"),
-        file_name=f"{run['run_id']}_leaderboard.csv",
-        mime="text/csv",
-    )
-    st.download_button(
-        "Download complete run JSON",
-        data=json.dumps(run, indent=2, ensure_ascii=False).encode("utf-8"),
-        file_name=f"{run['run_id']}.json",
-        mime="application/json",
-    )
+    csv_col, pdf_col, json_col = st.columns(3)
+    with csv_col:
+        st.download_button(
+            "Download leaderboard CSV",
+            data=filtered.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"{run['run_id']}_leaderboard.csv",
+            mime="text/csv",
+            width="stretch",
+        )
+    with pdf_col:
+        leaderboard_entries = [
+            " | ".join(
+                f"{column}: {row.get(column, '—')}"
+                for column in [
+                    "Rank",
+                    "Supplier",
+                    "AI weighted score",
+                    "PPI (peer benchmark)",
+                    "Quoted total",
+                    "Grade",
+                    "Quantity (MT)",
+                ]
+            )
+            for row in filtered.to_dict(orient="records")
+        ]
+        st.download_button(
+            "Download leaderboard PDF",
+            data=build_report_pdf(
+                "Forge Steel RFP AI - Supplier Leaderboard",
+                [
+                    f"Evaluation: {run['run_id']}",
+                    f"Ranking policy: {run['ranking_policy']}",
+                ],
+                [("Supplier rankings", leaderboard_entries or ["No supplier results."])],
+            ),
+            file_name=f"{run['run_id']}_leaderboard.pdf",
+            mime="application/pdf",
+            width="stretch",
+        )
+    with json_col:
+        st.download_button(
+            "Download complete run JSON",
+            data=json.dumps(run, indent=2, ensure_ascii=False).encode("utf-8"),
+            file_name=f"{run['run_id']}.json",
+            mime="application/json",
+            width="stretch",
+        )
     if run.get("warnings"):
         with st.expander("Run warnings"):
             for warning in run["warnings"]:
@@ -743,6 +1226,63 @@ def render_comparison(run: dict[str, Any]) -> None:
                     "AI explanation": result.get("justification"),
                 })
     st.dataframe(pd.DataFrame(comparison), width="stretch", hide_index=True)
+    st.subheader("What-if analysis")
+    st.caption(
+        "Hypothetical only: adjust relative criterion weights to explore ranking "
+        "sensitivity. This does not change or save the official run."
+    )
+    weight_rows = [
+        {"Criterion": item["name"], "Weight (%)": float(item["weight"])}
+        for item in criteria
+    ]
+    edited_weights = st.data_editor(
+        pd.DataFrame(weight_rows),
+        hide_index=True,
+        disabled=["Criterion"],
+        column_config={
+            "Weight (%)": st.column_config.NumberColumn(
+                min_value=0.0, max_value=100.0, step=1.0
+            )
+        },
+        key=f"scenario_weights_{run['run_id']}",
+        width="stretch",
+    )
+    scenario_weight_map = {
+        item["id"]: (
+            float(edited_weights.iloc[index]["Weight (%)"])
+            if pd.notna(edited_weights.iloc[index]["Weight (%)"])
+            else 0.0
+        )
+        for index, item in enumerate(criteria)
+    }
+    try:
+        scenario = evaluate_scenario(suppliers, run["criteria"], scenario_weight_map)
+        sensitivity = analyze_sensitivity(
+            suppliers, run["criteria"], simulations=200, seed=42
+        )
+    except ValueError as exc:
+        st.error(f"Cannot calculate the hypothetical scenario: {exc}")
+    else:
+        st.dataframe(
+            [
+                {
+                    "Scenario rank": item.get("rank"),
+                    "Supplier": item.get("name"),
+                    "Baseline rank": item.get("baseline_rank"),
+                    "Rank movement": item.get("rank_movement"),
+                    "Weighted score": item.get("absolute_score"),
+                    "PPI": item.get("ppi"),
+                }
+                for item in scenario["ranked_suppliers"]
+            ],
+            hide_index=True,
+            width="stretch",
+        )
+        st.caption(
+            "Under seeded ±10 percentage-point weight perturbations, the baseline "
+            f"winner remained first in {sensitivity['winner_stability_pct']}% "
+            f"of {sensitivity['simulations']} hypothetical trials."
+        )
     st.subheader("Supplier findings")
     for supplier in suppliers:
         if supplier["name"] not in selected_names:
@@ -985,8 +1525,41 @@ def render_settings() -> None:
 
 def render_qa_bot(run: dict[str, Any]) -> None:
     st.title("Q&A Bot")
-    st.caption("Ask evidence-grounded questions about this run's project documents and one selected supplier.")
-    render_run_badges(run)
+    runs = list_runs()
+    if runs:
+        run_ids = [item["run_id"] for item in runs]
+        active_run_id = st.session_state.get("active_run_id", run["run_id"])
+        if st.session_state.get("qa_selected_run_id") != active_run_id:
+            st.session_state.qa_selected_run_id = active_run_id
+        selected_run_id = st.selectbox(
+            "Select evaluation",
+            run_ids,
+            format_func=lambda run_id: next(
+                (
+                    f"{item['run_id']} · {'Demo' if item['is_demo'] else item['mode']}"
+                    for item in runs
+                    if item["run_id"] == run_id
+                ),
+                run_id,
+            ),
+            key="qa_selected_run_id",
+        )
+        if selected_run_id != active_run_id:
+            st.session_state.active_run_id = selected_run_id
+            st.rerun()
+        selected_run = load_run(selected_run_id)
+        if selected_run is None:
+            st.error("The selected evaluation could not be loaded.")
+            return
+        run = selected_run
+
+    st.info(
+        "**How answers are made:** We search the selected evaluation's shared RFP "
+        "and, if selected, that supplier's documents. BM25 keyword search is combined "
+        "with semantic embeddings (Claude uses BM25 only). The selected language model "
+        "then writes an answer with document and page citations. Other suppliers and "
+        "the public internet are not searched."
+    )
     if run.get("is_demo"):
         st.info("The completed demo contains synthetic review examples, not a document corpus. Start a live run to use document Q&A.")
         return
@@ -997,7 +1570,7 @@ def render_qa_bot(run: dict[str, Any]) -> None:
         return
     suppliers = run.get("suppliers", [])
     scope_labels = ["Project requirements only"] + [item["name"] for item in suppliers]
-    selected_scope = st.selectbox("Evidence scope", scope_labels)
+    selected_scope = st.selectbox("Chat about", scope_labels)
     selected_supplier = next(
         (item for item in suppliers if item["name"] == selected_scope),
         None,
@@ -1029,12 +1602,9 @@ def render_qa_bot(run: dict[str, Any]) -> None:
             or ""
         )
     st.caption(
-        f"Scope: {len(scoped_docs)} document(s), {len(chunks)} evidence chunk(s). "
-        "No public internet or other supplier submissions are searched."
-    )
-    st.caption(
-        f"Q&A uses the current LLM Settings selection: {provider} · `{model}`. "
-        f"This run was evaluated with {run.get('provider', 'unknown')} · `{run.get('model', 'unknown')}`."
+        f"Answer model: {provider} · `{model}`  |  Evaluation model: "
+        f"{run.get('provider', 'unknown')} · `{run.get('model', 'unknown')}`  |  "
+        f"{len(scoped_docs)} documents in this chat"
     )
     with st.expander("Documents in this Q&A scope"):
         for document in scoped_docs:
@@ -1067,6 +1637,31 @@ def render_qa_bot(run: dict[str, Any]) -> None:
 
     history_key = f"qa_history_{run['run_id']}_{supplier_id or 'shared'}"
     history = st.session_state.setdefault(history_key, [])
+    if history:
+        csv_column, pdf_column = st.columns(2)
+        export_stem = f"{run['run_id']}_{supplier_id or 'requirements'}_qa"
+        with csv_column:
+            st.download_button(
+                "Export chat as CSV",
+                data=build_qa_csv(history),
+                file_name=f"{export_stem}.csv",
+                mime="text/csv",
+                width="stretch",
+            )
+        with pdf_column:
+            st.download_button(
+                "Export chat as PDF",
+                data=build_qa_pdf(
+                    history,
+                    run_id=run["run_id"],
+                    scope=selected_scope,
+                ),
+                file_name=f"{export_stem}.pdf",
+                mime="application/pdf",
+                width="stretch",
+            )
+    else:
+        st.caption("Your chat exports will appear here after the first answer.")
     for exchange in history:
         with st.chat_message("user"):
             st.markdown(exchange["question"])
@@ -1195,11 +1790,235 @@ def render_run_badges(run: dict[str, Any]) -> None:
         st.caption(f"Provider: {run.get('provider')} · Model: {run.get('model')} · Created: {run.get('created_at')}")
 
 
+def render_history(run: dict[str, Any]) -> None:
+    st.title("Run history")
+    st.caption("Inspect saved evaluations, criteria, warnings, LangGraph traces, and audit events. This page reads SQLite only and never calls an LLM.")
+    render_run_badges(run)
+    runs = list_runs()
+    st.subheader("Saved runs")
+    st.dataframe(
+        [
+            {
+                "Run ID": item["run_id"],
+                "Created": item["created_at"],
+                "Mode": item["mode"],
+                "Status": item["status"],
+                "Synthetic demo": item["is_demo"],
+            }
+            for item in runs
+        ],
+        hide_index=True,
+        width="stretch",
+    )
+    run_export_rows = []
+    criterion_report_entries = []
+    for supplier in run.get("suppliers", []):
+        results = supplier.get("criteria_results", [])
+        if not results:
+            run_export_rows.append(
+                {
+                    "Run ID": run["run_id"],
+                    "Supplier": supplier.get("name"),
+                    "Rank": supplier.get("rank"),
+                    "Supplier status": "Failed" if supplier.get("evaluation_error") else "Complete",
+                    "Weighted score": supplier.get("absolute_score"),
+                    "PPI": supplier.get("ppi"),
+                    "Criterion": "",
+                    "AI score": "",
+                    "Maximum score": "",
+                    "Criterion status": "",
+                    "Evidence": "",
+                    "Source": "",
+                    "Page": "",
+                    "Explanation": "",
+                }
+            )
+        for result in results:
+            source = result.get("source_file") or ""
+            run_export_rows.append(
+                {
+                    "Run ID": run["run_id"],
+                    "Supplier": supplier.get("name"),
+                    "Rank": supplier.get("rank"),
+                    "Supplier status": "Failed" if supplier.get("evaluation_error") else "Complete",
+                    "Weighted score": supplier.get("absolute_score"),
+                    "PPI": supplier.get("ppi"),
+                    "Criterion": result.get("criterion_name") or result.get("criterion_id"),
+                    "AI score": result.get("ai_score"),
+                    "Maximum score": result.get("max_score"),
+                    "Criterion status": result.get("ai_status"),
+                    "Evidence": result.get("evidence"),
+                    "Source": source,
+                    "Page": result.get("page"),
+                    "Explanation": result.get("justification"),
+                }
+            )
+            evidence = result.get("evidence") or "No evidence was recorded."
+            citation = source
+            if result.get("page"):
+                citation += f", page {result['page']}"
+            criterion_report_entries.append(
+                f"{supplier.get('name')} | {result.get('criterion_name') or result.get('criterion_id')} "
+                f"| score {result.get('ai_score', '—')}/{result.get('max_score', '—')} "
+                f"| {result.get('ai_status', 'UNKNOWN')} | {evidence} "
+                f"| Source: {citation or '—'}"
+            )
+
+    history_csv = pd.DataFrame(run_export_rows).to_csv(index=False).encode("utf-8-sig")
+    supplier_report_entries = [
+        f"Rank {supplier.get('rank', '—')} | {supplier.get('name', 'Unknown supplier')} "
+        f"| {'Failed' if supplier.get('evaluation_error') else 'Complete'} "
+        f"| Weighted score: {supplier.get('absolute_score', '—')} "
+        f"| PPI: {supplier.get('ppi', '—')}"
+        + (
+            f" | Error: {supplier['evaluation_error']}"
+            if supplier.get("evaluation_error")
+            else ""
+        )
+        for supplier in run.get("suppliers", [])
+    ]
+    history_pdf = build_report_pdf(
+        "Forge Steel RFP AI - Evaluation Report",
+        [
+            f"Evaluation: {run['run_id']}",
+            f"Mode: {run.get('mode', '—')} | Status: {run.get('status', '—')}",
+            f"Created: {run.get('created_at', '—')}",
+            f"Provider/model: {run.get('provider', '—')} / {run.get('model', '—')}",
+        ],
+        [
+            ("Supplier scorecards", supplier_report_entries or ["No suppliers were recorded."]),
+            ("Criterion evidence", criterion_report_entries or ["No criterion results were recorded."]),
+        ],
+    )
+    csv_col, pdf_col, json_col = st.columns(3)
+    with csv_col:
+        st.download_button(
+            "Export selected run as CSV",
+            data=history_csv,
+            file_name=f"{run['run_id']}.csv",
+            mime="text/csv",
+            width="stretch",
+        )
+    with pdf_col:
+        st.download_button(
+            "Export selected run as PDF",
+            data=history_pdf,
+            file_name=f"{run['run_id']}.pdf",
+            mime="application/pdf",
+            width="stretch",
+        )
+    with json_col:
+        st.download_button(
+            "Export selected run as JSON",
+            data=json.dumps(run, ensure_ascii=False, indent=2),
+            file_name=f"{run['run_id']}.json",
+            mime="application/json",
+            width="stretch",
+        )
+    st.subheader("Supplier scorecards")
+    st.dataframe(
+        [
+            {
+                "Rank": supplier.get("rank"),
+                "Supplier": supplier.get("name"),
+                "Status": "Failed" if supplier.get("evaluation_error") else "Complete",
+                "Weighted score": supplier.get("absolute_score"),
+                "PPI": supplier.get("ppi"),
+                "Error": supplier.get("evaluation_error"),
+            }
+            for supplier in run.get("suppliers", [])
+        ],
+        hide_index=True,
+        width="stretch",
+    )
+    warnings = evaluation_warnings(run["run_id"])
+    with st.expander(f"Warnings ({len(warnings)})", expanded=bool(warnings)):
+        if warnings:
+            st.dataframe(warnings, hide_index=True, width="stretch")
+        else:
+            st.caption("No warnings were recorded.")
+
+    traces = workflow_traces(run["run_id"])
+    with st.expander(f"Workflow trace ({len(traces)} stages)"):
+        if traces:
+            st.dataframe(
+                [
+                    {
+                        **{key: value for key, value in item.items() if key != "details"},
+                        "details": json.dumps(item["details"], ensure_ascii=False),
+                    }
+                    for item in traces
+                ],
+                hide_index=True,
+                width="stretch",
+            )
+        else:
+            st.caption("This run has no LangGraph trace (for example, an older or synthetic run).")
+
+    events = audit_events(run["run_id"])
+    with st.expander(f"Audit events ({len(events)})"):
+        if events:
+            st.dataframe(
+                [
+                    {
+                        **{key: value for key, value in item.items() if key != "details"},
+                        "details": json.dumps(item["details"], ensure_ascii=False),
+                    }
+                    for item in events
+                ],
+                hide_index=True,
+                width="stretch",
+            )
+        else:
+            st.caption("No workflow audit events were recorded.")
+
+    chain_valid, invalid_sequence = verify_audit_chain()
+    if chain_valid:
+        st.success("Tamper-evident audit chain verified against saved run snapshots.")
+    else:
+        st.error(
+            "Audit-chain verification failed"
+            + (f" at sequence {invalid_sequence}." if invalid_sequence else ".")
+        )
+    with st.expander("Tamper-evident audit chain"):
+        chain_entries = list_audit_chain(run["run_id"])
+        if chain_entries:
+            st.caption(
+                "Hashes make later changes detectable; they do not prevent an "
+                "administrator from replacing the local SQLite database."
+            )
+            st.dataframe(chain_entries, hide_index=True, width="stretch")
+        else:
+            st.caption("No hash-chain entries were recorded for this run.")
+
+    criteria = criterion_evaluations(run["run_id"])
+    with st.expander(f"Criterion evaluations ({len(criteria)})"):
+        if criteria:
+            st.dataframe(
+                [
+                    {
+                        "Supplier ID": item["supplier_id"],
+                        "Criterion": item["criterion_id"],
+                        "Score": item["score"],
+                        "Status": item["status"],
+                        "Justification": item["evaluation"].get("justification"),
+                        "Source": item["evaluation"].get("source_file"),
+                        "Page": item["evaluation"].get("page"),
+                    }
+                    for item in criteria
+                ],
+                hide_index=True,
+                width="stretch",
+            )
+        else:
+            st.caption("No per-criterion records were saved for this run.")
+
+
 def main() -> None:
     st.session_state.criteria = load_criteria() or [dict(item) for item in STARTER_CRITERIA]
     if "llm_provider" not in st.session_state:
         st.session_state.llm_provider = get_app_setting("llm_provider") or "Cohere.ai"
-    pages = ["Home", "New evaluation", "Leaderboard", "Compare & review", "Q&A Bot", "Criteria", "LLM Settings"]
+    pages = ["Home", "New evaluation", "Leaderboard", "Compare & review", "History", "Q&A Bot", "Criteria", "LLM Settings"]
     pending_page = st.session_state.pop("pending_workspace_page", None)
     if pending_page in pages:
         st.session_state["workspace_page"] = pending_page
@@ -1249,6 +2068,8 @@ def main() -> None:
             st.info("Create an evaluation or explore the completed demo from Home.")
         elif page == "Leaderboard":
             render_leaderboard(run)
+        elif page == "History":
+            render_history(run)
         elif page == "Q&A Bot":
             render_qa_bot(run)
         else:

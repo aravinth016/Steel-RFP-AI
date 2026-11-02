@@ -7,6 +7,7 @@ from src.llm_providers import (
     _friendly_error,
     call_llm,
     call_llm_text,
+    call_llm_with_usage,
     model_options,
     secret_name,
     test_connection,
@@ -50,10 +51,18 @@ class LLMProviderSettingsTests(unittest.TestCase):
     def test_gemini_api_key_is_sent_in_header_not_url(self, post):
         response = Mock()
         response.json.return_value = {
-            "candidates": [{"content": {"parts": [{"text": '{"ok": true}'}]}}]
+            "candidates": [{"content": {"parts": [{"text": '{"ok": true}'}]}}],
+            "usageMetadata": {
+                "promptTokenCount": 21,
+                "candidatesTokenCount": 8,
+            },
         }
         post.return_value = response
         self.assertEqual(call_llm("Gemini", "secret-value", "gemini-model", "prompt"), '{"ok": true}')
+        generation = call_llm_with_usage(
+            "Gemini", "secret-value", "gemini-model", "prompt"
+        )
+        self.assertEqual((generation.input_tokens, generation.output_tokens), (21, 8))
         kwargs = post.call_args.kwargs
         self.assertEqual(kwargs["headers"], {"x-goog-api-key": "secret-value"})
         self.assertNotIn("secret-value", post.call_args.args[0])
@@ -72,9 +81,14 @@ class LLMProviderSettingsTests(unittest.TestCase):
     def test_cohere_adapter_returns_generated_text(self, client_factory):
         response = Mock()
         response.message.content = [SimpleNamespace(text='{"provider":"cohere"}')]
+        response.usage.tokens = SimpleNamespace(input_tokens=12, output_tokens=7)
         client_factory.return_value.chat.return_value = response
-        text = call_llm("Cohere.ai", "key", "command-a-plus-05-2026", "prompt")
-        self.assertEqual(text, '{"provider":"cohere"}')
+        generation = call_llm_with_usage(
+            "Cohere.ai", "key", "command-a-plus-05-2026", "prompt"
+        )
+        self.assertEqual(generation.text, '{"provider":"cohere"}')
+        self.assertEqual(generation.input_tokens, 12)
+        self.assertEqual(generation.output_tokens, 7)
         client_factory.assert_called_once_with(api_key="key", timeout=180)
         self.assertEqual(
             client_factory.return_value.chat.call_args.kwargs["max_tokens"],
@@ -154,24 +168,42 @@ class LLMProviderSettingsTests(unittest.TestCase):
         client_factory.return_value.messages.create.return_value.content = [
             SimpleNamespace(type="text", text='{"provider":"claude"}')
         ]
+        client_factory.return_value.messages.create.return_value.usage = SimpleNamespace(
+            input_tokens=31, output_tokens=9
+        )
         text = call_llm("Claude", "key", "claude-sonnet-5-5", "prompt")
         self.assertEqual(text, '{"provider":"claude"}')
+        generation = call_llm_with_usage(
+            "Claude", "key", "claude-sonnet-5-5", "prompt"
+        )
+        self.assertEqual((generation.input_tokens, generation.output_tokens), (31, 9))
 
     @patch("openai.OpenAI")
     def test_chatgpt_adapter_returns_generated_text(self, client_factory):
         client_factory.return_value.chat.completions.create.return_value.choices = [
             SimpleNamespace(message=SimpleNamespace(content='{"provider":"chatgpt"}'))
         ]
+        client_factory.return_value.chat.completions.create.return_value.usage = (
+            SimpleNamespace(prompt_tokens=42, completion_tokens=13)
+        )
         text = call_llm("ChatGPT", "key", "gpt-4.1", "prompt")
         self.assertEqual(text, '{"provider":"chatgpt"}')
+        generation = call_llm_with_usage("ChatGPT", "key", "gpt-4.1", "prompt")
+        self.assertEqual((generation.input_tokens, generation.output_tokens), (42, 13))
 
     @patch("openai.OpenAI")
     def test_openrouter_adapter_uses_openrouter_endpoint_and_returns_json(self, client_factory):
         client_factory.return_value.chat.completions.create.return_value.choices = [
             SimpleNamespace(message=SimpleNamespace(content='{"provider":"openrouter"}'))
         ]
-        text = call_llm("OpenRouter", "key", "openai/gpt-4.1-mini", "prompt")
-        self.assertEqual(text, '{"provider":"openrouter"}')
+        client_factory.return_value.chat.completions.create.return_value.usage = (
+            SimpleNamespace(prompt_tokens=52, completion_tokens=17)
+        )
+        generation = call_llm_with_usage(
+            "OpenRouter", "key", "openai/gpt-4.1-mini", "prompt"
+        )
+        self.assertEqual(generation.text, '{"provider":"openrouter"}')
+        self.assertEqual((generation.input_tokens, generation.output_tokens), (52, 17))
         client_factory.assert_called_once_with(
             api_key="key",
             base_url="https://openrouter.ai/api/v1",
@@ -184,6 +216,19 @@ class LLMProviderSettingsTests(unittest.TestCase):
             ],
             {"type": "json_object"},
         )
+
+    @patch("anthropic.Anthropic")
+    def test_usage_is_unavailable_when_provider_omits_metadata(self, client_factory):
+        response = client_factory.return_value.messages.create.return_value
+        response.content = [SimpleNamespace(type="text", text='{"ok": true}')]
+        response.usage = None
+
+        generation = call_llm_with_usage(
+            "Claude", "key", "claude-sonnet-5-5", "prompt"
+        )
+
+        self.assertIsNone(generation.input_tokens)
+        self.assertIsNone(generation.output_tokens)
 
     @patch("openai.OpenAI")
     def test_openrouter_connection_test_uses_selected_model(self, client_factory):

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -82,6 +84,63 @@ def initialize() -> None:
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS workflow_traces (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+                supplier_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                node TEXT NOT NULL,
+                status TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                completed_at TEXT NOT NULL,
+                details_json TEXT NOT NULL,
+                UNIQUE(run_id, supplier_id, sequence)
+            );
+            CREATE TABLE IF NOT EXISTS evaluation_warnings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+                supplier_id TEXT,
+                message TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(run_id, supplier_id, message)
+            );
+            CREATE TABLE IF NOT EXISTS audit_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+                supplier_id TEXT,
+                event_type TEXT NOT NULL,
+                event_at TEXT NOT NULL,
+                details_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS criterion_evaluations (
+                run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+                supplier_id TEXT NOT NULL,
+                criterion_id TEXT NOT NULL,
+                score REAL,
+                status TEXT NOT NULL,
+                evaluation_json TEXT NOT NULL,
+                PRIMARY KEY (run_id, supplier_id, criterion_id)
+            );
+            CREATE TABLE IF NOT EXISTS audit_chain (
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_key TEXT NOT NULL UNIQUE,
+                run_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                event_at TEXT NOT NULL,
+                payload_hash TEXT NOT NULL,
+                previous_hash TEXT NOT NULL,
+                entry_hash TEXT NOT NULL UNIQUE
+            );
+            CREATE TRIGGER IF NOT EXISTS audit_chain_no_update
+            BEFORE UPDATE ON audit_chain
+            BEGIN
+                SELECT RAISE(ABORT, 'audit_chain is append-only');
+            END;
+            CREATE TRIGGER IF NOT EXISTS audit_chain_no_delete
+            BEFORE DELETE ON audit_chain
+            BEGIN
+                SELECT RAISE(ABORT, 'audit_chain is append-only');
+            END;
             """
         )
         from src.scoring import STARTER_CRITERIA
@@ -259,6 +318,35 @@ def save_app_setting(key: str, value: str) -> None:
         )
 
 
+def reserve_next_run_id() -> str:
+    sequence_key = "_run_id_sequence"
+    with connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        setting = db.execute(
+            "SELECT value FROM app_settings WHERE key = ?",
+            (sequence_key,),
+        ).fetchone()
+        stored_sequence = int(setting["value"]) if setting else 0
+        existing_ids = db.execute("SELECT run_id FROM runs").fetchall()
+        existing_sequence = max(
+            (
+                int(match.group(1))
+                for row in existing_ids
+                if (match := re.fullmatch(r"RFP-(\d+)", row["run_id"]))
+            ),
+            default=0,
+        )
+        next_sequence = max(stored_sequence, existing_sequence) + 1
+        db.execute(
+            """
+            INSERT INTO app_settings(key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (sequence_key, str(next_sequence)),
+        )
+    return f"RFP-{next_sequence:04d}"
+
+
 def save_run(payload: dict[str, Any]) -> None:
     with connect() as db:
         db.execute(
@@ -308,6 +396,177 @@ def save_run(payload: dict[str, Any]) -> None:
                 for supplier in payload.get("suppliers", [])
             ],
         )
+        for table in (
+            "workflow_traces",
+            "evaluation_warnings",
+            "audit_events",
+            "criterion_evaluations",
+        ):
+            db.execute(f"DELETE FROM {table} WHERE run_id = ?", (payload["run_id"],))
+        db.executemany(
+            """
+            INSERT INTO workflow_traces(
+                run_id, supplier_id, sequence, node, status, started_at, completed_at, details_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    payload["run_id"],
+                    trace["supplier_id"],
+                    int(trace["sequence"]),
+                    trace["node"],
+                    trace["status"],
+                    trace["started_at"],
+                    trace["completed_at"],
+                    json.dumps(trace.get("details", {}), ensure_ascii=False),
+                )
+                for trace in payload.get("workflow_traces", [])
+            ],
+        )
+        db.executemany(
+            """
+            INSERT INTO audit_events(run_id, supplier_id, event_type, event_at, details_json)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    payload["run_id"],
+                    event.get("supplier_id"),
+                    event["event_type"],
+                    event["event_at"],
+                    json.dumps(event.get("details", {}), ensure_ascii=False),
+                )
+                for event in payload.get("audit_events", [])
+            ],
+        )
+        suppliers_by_name = {
+            str(supplier.get("name", "")).casefold(): str(supplier["supplier_id"])
+            for supplier in payload.get("suppliers", [])
+            if supplier.get("name") and supplier.get("supplier_id")
+        }
+        warning_rows = []
+        for warning in payload.get("warnings", []):
+            message = str(warning)
+            supplier_id = next(
+                (
+                    supplier_id
+                    for name, supplier_id in suppliers_by_name.items()
+                    if message.casefold().startswith(f"{name}:")
+                ),
+                None,
+            )
+            warning_rows.append(
+                (
+                    payload["run_id"],
+                    supplier_id,
+                    message,
+                    payload["created_at"],
+                )
+            )
+        db.executemany(
+            """
+            INSERT OR IGNORE INTO evaluation_warnings(run_id, supplier_id, message, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            warning_rows,
+        )
+        db.executemany(
+            """
+            INSERT INTO criterion_evaluations(
+                run_id, supplier_id, criterion_id, score, status, evaluation_json
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    payload["run_id"],
+                    supplier["supplier_id"],
+                    item["criterion_id"],
+                    (
+                        float(item.get("ai_score", item.get("score")))
+                        if item.get("ai_score", item.get("score")) is not None
+                        else None
+                    ),
+                    str(item.get("status", item.get("ai_status", "UNKNOWN"))),
+                    json.dumps(item, ensure_ascii=False),
+                )
+                for supplier in payload.get("suppliers", [])
+                for item in supplier.get("criteria_results", [])
+                if item.get("criterion_id") is not None
+            ],
+        )
+        snapshot_json = json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        _append_audit_entry(
+            db,
+            event_key=hashlib.sha256(
+                f"run_snapshot:{payload['run_id']}:{snapshot_json}".encode("utf-8")
+            ).hexdigest(),
+            run_id=payload["run_id"],
+            event_type="run_snapshot_saved",
+            event_at=payload["created_at"],
+            payload_hash=hashlib.sha256(snapshot_json.encode("utf-8")).hexdigest(),
+        )
+        for event in payload.get("audit_events", []):
+            event_json = json.dumps(
+                event, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            )
+            _append_audit_entry(
+                db,
+                event_key=hashlib.sha256(
+                    f"{payload['run_id']}:{event_json}".encode("utf-8")
+                ).hexdigest(),
+                run_id=payload["run_id"],
+                event_type=str(event["event_type"]),
+                event_at=str(event["event_at"]),
+                payload_hash=hashlib.sha256(event_json.encode("utf-8")).hexdigest(),
+            )
+
+
+def _append_audit_entry(
+    db: sqlite3.Connection,
+    *,
+    event_key: str,
+    run_id: str,
+    event_type: str,
+    event_at: str,
+    payload_hash: str,
+) -> None:
+    if db.execute(
+        "SELECT 1 FROM audit_chain WHERE event_key = ?", (event_key,)
+    ).fetchone():
+        return
+    latest = db.execute(
+        "SELECT entry_hash FROM audit_chain ORDER BY sequence DESC LIMIT 1"
+    ).fetchone()
+    previous_hash = latest["entry_hash"] if latest else "0" * 64
+    fields = {
+        "event_key": event_key,
+        "run_id": run_id,
+        "event_type": event_type,
+        "event_at": event_at,
+        "payload_hash": payload_hash,
+        "previous_hash": previous_hash,
+    }
+    entry_hash = hashlib.sha256(
+        json.dumps(fields, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    db.execute(
+        """
+        INSERT INTO audit_chain(
+            event_key, run_id, event_type, event_at, payload_hash, previous_hash, entry_hash
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            event_key,
+            run_id,
+            event_type,
+            event_at,
+            payload_hash,
+            previous_hash,
+            entry_hash,
+        ),
+    )
 
 
 def load_run(run_id: str) -> dict[str, Any] | None:
@@ -412,4 +671,165 @@ def review_events(run_id: str) -> list[dict[str, Any]]:
             "FROM review_events WHERE run_id = ? ORDER BY id DESC",
             (run_id,),
         ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def workflow_traces(run_id: str) -> list[dict[str, Any]]:
+    with connect() as db:
+        rows = db.execute(
+            """
+            SELECT supplier_id, sequence, node, status, started_at, completed_at, details_json
+            FROM workflow_traces
+            WHERE run_id = ?
+            ORDER BY supplier_id, sequence
+            """,
+            (run_id,),
+        ).fetchall()
+    return [
+        {**dict(row), "details": json.loads(row["details_json"])}
+        for row in rows
+    ]
+
+
+def evaluation_warnings(run_id: str) -> list[dict[str, Any]]:
+    with connect() as db:
+        rows = db.execute(
+            """
+            SELECT supplier_id, message, created_at
+            FROM evaluation_warnings
+            WHERE run_id = ?
+            ORDER BY id
+            """,
+            (run_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def audit_events(run_id: str) -> list[dict[str, Any]]:
+    with connect() as db:
+        rows = db.execute(
+            """
+            SELECT supplier_id, event_type, event_at, details_json
+            FROM audit_events
+            WHERE run_id = ?
+            ORDER BY id
+            """,
+            (run_id,),
+        ).fetchall()
+    return [
+        {**dict(row), "details": json.loads(row["details_json"])}
+        for row in rows
+    ]
+
+
+def criterion_evaluations(run_id: str) -> list[dict[str, Any]]:
+    with connect() as db:
+        rows = db.execute(
+            """
+            SELECT supplier_id, criterion_id, score, status, evaluation_json
+            FROM criterion_evaluations
+            WHERE run_id = ?
+            ORDER BY supplier_id, criterion_id
+            """,
+            (run_id,),
+        ).fetchall()
+    return [
+        {**dict(row), "evaluation": json.loads(row["evaluation_json"])}
+        for row in rows
+    ]
+
+
+def verify_audit_chain() -> tuple[bool, int | None]:
+    """Verify hashes and persisted run snapshots; return the first invalid sequence."""
+    previous_hash = "0" * 64
+    with connect() as db:
+        rows = db.execute(
+            """
+            SELECT sequence, event_key, run_id, event_type, event_at, payload_hash,
+                   previous_hash, entry_hash
+            FROM audit_chain
+            ORDER BY sequence
+            """
+        ).fetchall()
+        snapshots = db.execute(
+            """
+            SELECT run_id, payload FROM runs
+            """
+        ).fetchall()
+        latest_snapshots = db.execute(
+            """
+            SELECT chain.run_id, chain.sequence, chain.payload_hash
+            FROM audit_chain AS chain
+            JOIN (
+                SELECT run_id, MAX(sequence) AS sequence
+                FROM audit_chain
+                WHERE event_type = 'run_snapshot_saved'
+                GROUP BY run_id
+            ) AS latest
+              ON latest.run_id = chain.run_id AND latest.sequence = chain.sequence
+            """
+        ).fetchall()
+    for row in rows:
+        fields = {
+            "event_key": row["event_key"],
+            "run_id": row["run_id"],
+            "event_type": row["event_type"],
+            "event_at": row["event_at"],
+            "payload_hash": row["payload_hash"],
+            "previous_hash": previous_hash,
+        }
+        expected_hash = hashlib.sha256(
+            json.dumps(fields, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        if row["previous_hash"] != previous_hash or row["entry_hash"] != expected_hash:
+            return False, int(row["sequence"])
+        previous_hash = row["entry_hash"]
+    snapshot_hashes = {
+        row["run_id"]: row["payload_hash"] for row in latest_snapshots
+    }
+    for snapshot in snapshots:
+        canonical_payload = json.dumps(
+            json.loads(snapshot["payload"]),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        expected_payload_hash = hashlib.sha256(
+            canonical_payload.encode("utf-8")
+        ).hexdigest()
+        if (
+            snapshot["run_id"] in snapshot_hashes
+            and snapshot_hashes[snapshot["run_id"]] != expected_payload_hash
+        ):
+            run_row = next(
+                (
+                    row for row in rows
+                    if row["run_id"] == snapshot["run_id"]
+                    and row["event_type"] == "run_snapshot_saved"
+                ),
+                None,
+            )
+            return False, int(run_row["sequence"]) if run_row else None
+    return True, None
+
+
+def list_audit_chain(run_id: str | None = None) -> list[dict[str, Any]]:
+    with connect() as db:
+        if run_id is None:
+            rows = db.execute(
+                """
+                SELECT sequence, run_id, event_type, event_at, payload_hash,
+                       previous_hash, entry_hash
+                FROM audit_chain ORDER BY sequence
+                """
+            ).fetchall()
+        else:
+            rows = db.execute(
+                """
+                SELECT sequence, run_id, event_type, event_at, payload_hash,
+                       previous_hash, entry_hash
+                FROM audit_chain WHERE run_id = ? ORDER BY sequence
+                """,
+                (run_id,),
+            ).fetchall()
     return [dict(row) for row in rows]

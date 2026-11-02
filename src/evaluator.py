@@ -10,7 +10,7 @@ from typing import Any
 
 from jsonschema import Draft202012Validator
 
-from src.llm_providers import call_llm
+from src.llm_providers import LLMGeneration, call_llm_with_usage
 
 
 class EvaluationError(RuntimeError):
@@ -50,12 +50,14 @@ def evaluate_supplier(
         )
         retry_warnings = []
         try:
-            response_text = call_llm(provider, api_key, model, prompt)
+            generation = call_llm_with_usage(
+                provider, api_key, model, prompt
+            )
         except RuntimeError as exc:
             if provider not in ("Cohere", "Cohere.ai") or "output token limit" not in str(exc):
                 raise
             try:
-                response_text = call_llm(
+                generation = call_llm_with_usage(
                     provider,
                     api_key,
                     model,
@@ -72,6 +74,17 @@ def evaluate_supplier(
                 "Cohere reached the output token limit; evaluation was retried once with "
                 "compact output instructions."
             )
+        response_text = (
+            generation.text if isinstance(generation, LLMGeneration) else str(generation)
+        )
+        token_usage = (
+            {
+                "input_tokens": generation.input_tokens,
+                "output_tokens": generation.output_tokens,
+            }
+            if isinstance(generation, LLMGeneration)
+            else {"input_tokens": None, "output_tokens": None}
+        )
         raw_result = _parse_json_response(response_text)
         result, validation_warnings = _normalize_result(
             raw_result, criteria, mandatory_gates
@@ -99,6 +112,7 @@ def evaluate_supplier(
     result["validation_warnings"] = validation_warnings
     result["provider"] = provider
     result["model"] = model
+    result["token_usage"] = token_usage
     return result
 
 
@@ -495,7 +509,6 @@ def _normalize_result(
             evidence, source_id, page = None, None, None
             warnings.append(f"Malformed page citation for gate {gate_id!r} was cleared.")
         gates.append({
-            **gate,
             "id": gate_id,
             "status": gate_status,
             "requirement": configured["requirement"],
@@ -512,7 +525,6 @@ def _normalize_result(
     steel_offer, steel_warnings = _normalize_steel_offer(result)
     warnings.extend(steel_warnings)
     normalized = {
-        **result,
         "summary": summary,
         "gates": gates,
         "criteria": normalized_criteria,
@@ -825,6 +837,33 @@ def _build_prompt(
     for item in page_sets:
         permitted_pages.setdefault(item["source_id"], set()).add(int(item["page"]))
     return prompt, permitted_pages
+
+
+def estimate_prompt_tokens(
+    *,
+    supplier: dict[str, Any],
+    criteria: list[dict[str, Any]],
+    shared_documents: list[dict[str, Any]],
+    supplier_documents: list[dict[str, Any]],
+    use_rag: bool,
+    buyer_requirements: dict[str, Any] | None = None,
+) -> int:
+    """Estimate input tokens from the exact prompt using a documented 4-char heuristic."""
+    prompt, _ = _build_prompt(
+        supplier,
+        criteria,
+        shared_documents,
+        supplier_documents,
+        use_rag,
+        buyer_requirements=buyer_requirements,
+    )
+    return max(1, (len(prompt) + 3) // 4)
+
+
+def estimate_output_tokens(criteria: list[dict[str, Any]]) -> int:
+    """Estimate response size using a rough per-criterion JSON allowance."""
+    active_criteria = sum(bool(item.get("active", True)) for item in criteria)
+    return 200 + active_criteria * 140
 
 
 def _retrieve_pages(query: str, documents: list[dict[str, Any]], limit: int = 3) -> list[dict[str, Any]]:

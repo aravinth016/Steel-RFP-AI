@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -61,6 +62,37 @@ _SYSTEM_PROMPT = (
 )
 
 
+@dataclass(frozen=True)
+class LLMGeneration:
+    text: str
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+
+
+def _token_count(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        count = int(value)
+    except (TypeError, ValueError):
+        return None
+    return count if count >= 0 else None
+
+
+def _generation(text: str, usage: Any, input_key: str, output_key: str) -> LLMGeneration:
+    if isinstance(usage, dict):
+        input_tokens = usage.get(input_key)
+        output_tokens = usage.get(output_key)
+    else:
+        input_tokens = getattr(usage, input_key, None) if usage is not None else None
+        output_tokens = getattr(usage, output_key, None) if usage is not None else None
+    return LLMGeneration(
+        text=text,
+        input_tokens=_token_count(input_tokens),
+        output_tokens=_token_count(output_tokens),
+    )
+
+
 def model_options(provider: str) -> list[str]:
     try:
         return list(PROVIDERS[provider]["models"])
@@ -75,8 +107,23 @@ def secret_name(provider: str) -> str:
         raise ValueError(f"Unsupported LLM provider: {provider}") from exc
 
 
-def call_llm(provider: str, api_key: str, model: str, prompt: str) -> str:
+def call_llm(
+    provider: str,
+    api_key: str,
+    model: str,
+    prompt: str,
+) -> str:
     """Call one provider and return its generated JSON text."""
+    return call_llm_with_usage(provider, api_key, model, prompt).text
+
+
+def call_llm_with_usage(
+    provider: str,
+    api_key: str,
+    model: str,
+    prompt: str,
+) -> LLMGeneration:
+    """Call one provider and return text with provider-reported token usage."""
     try:
         if provider in ("Cohere", "Cohere.ai"):
             import cohere
@@ -88,9 +135,7 @@ def call_llm(provider: str, api_key: str, model: str, prompt: str) -> str:
                     {"role": "user", "content": prompt},
                 ],
                 "response_format": {"type": "json_object"},
-                "max_tokens": (
-                    16384 if model == "command-a-plus-05-2026" else 4096
-                ),
+                "max_tokens": 16384 if model == "command-a-plus-05-2026" else 4096,
                 "temperature": 0,
             }
             if model == "command-a-plus-05-2026":
@@ -106,7 +151,8 @@ def call_llm(provider: str, api_key: str, model: str, prompt: str) -> str:
             text = _cohere_response_text(response)
             if not text:
                 raise RuntimeError("Cohere returned an empty answer.")
-            return text
+            token_usage = getattr(getattr(response, "usage", None), "tokens", None)
+            return _generation(text, token_usage, "input_tokens", "output_tokens")
 
         if provider == "Claude":
             import anthropic
@@ -129,7 +175,7 @@ def call_llm(provider: str, api_key: str, model: str, prompt: str) -> str:
             )
             if not text:
                 raise RuntimeError("Claude returned no text content.")
-            return text
+            return _generation(text, getattr(response, "usage", None), "input_tokens", "output_tokens")
 
         if provider == "Gemini":
             import requests
@@ -140,7 +186,10 @@ def call_llm(provider: str, api_key: str, model: str, prompt: str) -> str:
                 json={
                     "systemInstruction": {"parts": [{"text": _SYSTEM_PROMPT}]},
                     "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-                    "generationConfig": {"responseMimeType": "application/json", "temperature": 0},
+                    "generationConfig": {
+                        "responseMimeType": "application/json",
+                        "temperature": 0,
+                    },
                 },
                 timeout=90,
             )
@@ -149,41 +198,52 @@ def call_llm(provider: str, api_key: str, model: str, prompt: str) -> str:
             text = payload["candidates"][0]["content"]["parts"][0]["text"]
             if not text:
                 raise RuntimeError("Gemini returned no text content.")
-            return text
+            return _generation(
+                text,
+                payload.get("usageMetadata"),
+                "promptTokenCount",
+                "candidatesTokenCount",
+            )
 
         if provider == "ChatGPT":
             from openai import OpenAI
 
-            response = OpenAI(api_key=api_key, timeout=90).chat.completions.create(
-                model=model,
-                messages=[
+            options: dict[str, Any] = {
+                "model": model,
+                "messages": [
                     {"role": "system", "content": _SYSTEM_PROMPT},
                     {"role": "user", "content": prompt},
                 ],
-                response_format={"type": "json_object"},
-                temperature=0,
-            )
+                "response_format": {"type": "json_object"},
+                "temperature": 0,
+            }
+            response = OpenAI(api_key=api_key, timeout=90).chat.completions.create(**options)
             text = response.choices[0].message.content
             if not text:
                 raise RuntimeError("ChatGPT returned no text content.")
-            return text
+            return _generation(
+                text, getattr(response, "usage", None), "prompt_tokens", "completion_tokens"
+            )
 
         if provider == "OpenRouter":
             logger.info("Starting LLM request: provider=%s model=%s", provider, model)
-            response = _openrouter_client(api_key, timeout=90).chat.completions.create(
-                model=model,
-                messages=[
+            options = {
+                "model": model,
+                "messages": [
                     {"role": "system", "content": _SYSTEM_PROMPT},
                     {"role": "user", "content": prompt},
                 ],
-                response_format={"type": "json_object"},
-                temperature=0,
-            )
+                "response_format": {"type": "json_object"},
+                "temperature": 0,
+            }
+            response = _openrouter_client(api_key, timeout=90).chat.completions.create(**options)
             text = response.choices[0].message.content
             if not text:
                 raise RuntimeError("OpenRouter returned no text content.")
             logger.info("LLM response received: provider=%s model=%s", provider, model)
-            return text
+            return _generation(
+                text, getattr(response, "usage", None), "prompt_tokens", "completion_tokens"
+            )
 
         raise ValueError(f"Unsupported LLM provider: {provider}")
     except ImportError as exc:
